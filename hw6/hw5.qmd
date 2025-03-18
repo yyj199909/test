@@ -1,0 +1,343 @@
+---
+title: "Biostat 203B Homework 5"
+subtitle: Due Mar 20 @ 11:59PM
+author: "zhengda wang (905788829)"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    number-sections: false
+    toc: true
+    toc-depth: 4
+    toc-location: left
+    code-fold: false
+---
+
+## Predicting ICU duration
+
+```{r}
+sessionInfo()
+```
+
+
+## Data preprocessing & Partition
+
+```{r}
+library(GGally)
+library(ranger)
+library(stacks)
+library(keras)
+library(gtsummary)
+library(tidyverse)
+library(tidymodels)
+library(vip)
+
+
+mimiciv_icu_cohort <- readRDS("mimiciv_shiny/mimic_icu_cohort.rds") %>%
+  mutate(
+    gender = as.character(gender),
+    insurance = as.character(insurance),
+    marital_status = as.character(marital_status),
+    first_careunit = as.character(first_careunit),
+    los_long = as.factor(los_long)
+  )
+# Due to a significant amount of missing data in the 'last lab 
+# measurements before the ICU stay' section, only the 
+# rows with data in these columns will be retained
+mimiciv_icu_cohort <- mimiciv_icu_cohort[complete.cases(
+  mimiciv_icu_cohort[,
+    c(28:34, 41)]
+), ]
+
+mimiciv_icu_cohort %>%
+  tbl_summary(by = los_long)
+
+# initial split into test and non-test sets
+set.seed(203)
+
+# sort
+mimiciv_icu_cohort <- mimiciv_icu_cohort %>%
+  arrange(subject_id, hadm_id, stay_id)
+
+data_split <- initial_split(
+  mimiciv_icu_cohort, 
+  # stratify by los_long
+  strata = "los_long", 
+  prop = 0.5
+)
+data_split
+
+mimic_train <- training(data_split)
+mimic_test <- testing(data_split)
+
+```
+
+## Recipe
+
+```{r}
+# Recipe
+mimic_recipe <- recipe(
+  los_long ~ first_careunit + `Heart Rate` +
+    `Non Invasive Blood Pressure systolic` +
+    Hematocrit + Bicarbonate + admission_type +
+    admission_location + `White Blood Cells` +
+    `Respiratory Rate`, data = mimic_train
+) %>%
+  step_impute_mean(
+    `Heart Rate`, `Non Invasive Blood Pressure systolic`,
+    `Respiratory Rate`, `White Blood Cells`
+  ) %>%
+  # mode imputation
+step_impute_mode(first_careunit) %>%
+  # create traditional dummy variables
+step_dummy(all_nominal_predictors()) %>%
+  # zero-variance filter
+step_zv(all_numeric_predictors()) %>%
+  # center and scale numeric data
+step_normalize(all_numeric_predictors()) %>%
+  # estimate the means and standard deviations prep(training =
+  # Heart_other, retain = TRUE) %>%
+print()
+```
+
+set up the cross-validation folds
+
+```{r}
+set.seed(203)
+folds <- vfold_cv(mimic_train, v = 5)
+```
+
+
+## Logistic regression
+
+```{r}
+logit_mod <- 
+  logistic_reg(
+    penalty = tune(), 
+    mixture = tune()
+  ) %>% 
+  set_engine("glmnet", standardize = TRUE)
+
+logit_wf <- workflow() %>%
+  add_recipe(mimic_recipe) %>%
+  add_model(logit_mod)
+
+logit_grid <- grid_regular(
+  penalty(range = c(-6, 3)), 
+  mixture(),
+  levels = c(100, 5)
+  )
+
+logit_res <- 
+  tune_grid(
+    object = logit_wf, 
+    resamples = folds, 
+    grid = logit_grid,
+    metrics = metric_set(roc_auc, accuracy),
+    control = control_stack_grid()
+  )
+logit_res
+```
+
+## Random forest
+
+```{r}
+rf_mod <- 
+  rand_forest(
+    mode = "classification",
+    # Number of predictors randomly sampled in each split
+    mtry = tune(),
+    # Number of trees in ensemble
+    trees = tune()
+  ) %>% 
+  set_engine("ranger")
+rf_mod
+
+
+# Workflow
+rf_wf <- workflow() %>%
+  add_recipe(mimic_recipe) %>%
+  add_model(rf_mod)
+rf_wf
+
+# Tuning grid
+rf_grid <- grid_regular(
+  trees(range = c(100L, 500L)), 
+  mtry(range = c(1L, 3L)),
+  levels = c(5, 3)
+  )
+
+rf_res <- 
+  tune_grid(
+    object = rf_wf, 
+    resamples = folds, 
+    grid = rf_grid,
+    metrics = metric_set(roc_auc, accuracy),
+    control = control_stack_grid()
+  )
+rf_res
+
+```
+
+## Neural network
+
+```{r}
+mlp_mod <- 
+  mlp(
+    mode = "classification",
+    hidden_units = tune(),
+    dropout = tune(),
+    epochs = 20,
+  ) %>% 
+  set_engine("keras", verbose = 1)
+
+mlp_wf <- workflow() %>%
+  add_recipe(mimic_recipe) %>%
+  add_model(mlp_mod)
+
+
+mlp_grid <- grid_regular(
+  hidden_units(range = c(1, 20)),
+  dropout(range = c(0, 0.6)),
+  levels = 3
+  )
+
+mlp_res <- 
+  tune_grid(
+    object = mlp_wf, 
+    resamples = folds, 
+    grid = mlp_grid,
+    metrics = metric_set(roc_auc, accuracy),
+    control = control_stack_grid()
+  )
+mlp_res
+
+```
+
+## Model stacking
+
+Build the stacked ensemble
+
+```{r}
+mimic_model_st <- 
+  # initialize the stack
+  stacks() %>%
+  # add candidate members
+  add_candidates(logit_res) %>%
+  add_candidates(rf_res) %>%
+  add_candidates(mlp_res) %>%
+  # determine how to combine their predictions
+  blend_predictions(
+    penalty = 10^(-6:2),
+    metrics = c("roc_auc")
+    ) %>%
+  # fit the candidates with nonzero stacking coefficients
+  fit_members()
+```
+
+## Compare the accuracy and ROC_AUC
+
+Answer: The accuracy and ROC_AUC of Logistic regression are 0.57 and 0.60, respectively. The accuracy and ROC_AUC of Random forest are 0.59 and 0.62, respectively. The accuracy and ROC_AUC of Logistic regression are 0.58 and 0.61, respectively. And the accuracy and ROC_AUC of Model stacking are 0.59 and 0.62, respectively.
+
+Logistic regression
+
+```{r}
+best_logit_wf <- select_best(logit_res, metric = "roc_auc")
+final_logit_wf <- finalize_workflow(logit_wf, best_logit_wf)
+
+final_logit_fit <- fit(final_logit_wf, data = mimic_train)
+
+
+
+yardstick::accuracy(
+  mimic_test %>%
+    bind_cols(predict(final_logit_fit, .)),
+  truth = los_long, contains(".pred_class")
+)
+
+yardstick::roc_auc(
+  mimic_test %>%
+    bind_cols(predict(final_logit_fit, ., type = "prob")),
+  truth = los_long, contains(".pred_FALSE")
+)
+```
+
+random forest
+
+```{r}
+best_rf_wf <- select_best(rf_res, metric = "roc_auc")
+final_rf_wf <- finalize_workflow(rf_wf, best_rf_wf)
+
+final_rf_fit <- fit(final_rf_wf, data = mimic_train)
+
+
+
+yardstick::accuracy(
+  mimic_test %>%
+    bind_cols(predict(final_rf_fit, .)),
+  truth = los_long, contains(".pred_class")
+)
+
+yardstick::roc_auc(
+  mimic_test %>%
+    bind_cols(predict(final_rf_fit, ., type = "prob")),
+  truth = los_long, contains(".pred_FALSE")
+)
+```
+
+Neural network
+
+```{r}
+best_mlp_wf <- select_best(mlp_res, metric = "roc_auc")
+final_mlp_wf <- finalize_workflow(mlp_wf, best_mlp_wf)
+
+final_mlp_fit <- fit(final_mlp_wf, data = mimic_train)
+
+
+
+yardstick::accuracy(
+  mimic_test %>%
+    bind_cols(predict(final_mlp_fit, .)),
+  truth = los_long, contains(".pred_class")
+)
+
+yardstick::roc_auc(
+  mimic_test %>%
+    bind_cols(predict(final_mlp_fit, ., type = "prob")),
+  truth = los_long, contains(".pred_FALSE")
+)
+```
+
+Model stacking
+
+```{r}
+mimic_pred <- mimic_test %>%
+  bind_cols(predict(mimic_model_st, ., type = "prob")) %>%
+  print(width = Inf)
+
+# accuracy
+yardstick::accuracy(
+  mimic_test %>%
+    bind_cols(predict(mimic_model_st, .)),
+  truth = los_long, contains(".pred_class")
+)
+# ROC_AUC
+yardstick::roc_auc(
+  mimic_pred, truth = los_long,
+  contains(".pred_FALSE")
+)
+```
+
+## The most important features in predicting long ICU stay based on logistic regression
+
+Answer: The most important features in predicting los_long are hematocrit, Non Invasive Blood Pressure systolic, Bicarbonate, first careunit, heart rate, admission location, white blood cells and respiratory rate.
+
+```{r}
+final_logit_fit <- fit(final_logit_wf, data = mimic_train)
+vip(final_logit_fit$fit$fit)
+
+```
+
+## How do the models compare in terms of performance and interpretability?
+
+Answer: The performance comparison between models is achieved by comparing the accuracy and AUC of the predicted results, and models with higher accuracy and AUC generally perform better.The interpretability of a model is characterized by its results. Logistic regression model has higher interpretability when used for classification prediction, as they can directly output the relationship between features and prediction results. Complex models generally have poorer interpretability but better performance. In this work, the accuracy and AUC of random forest and neural network models are higher than logistic regreesion model.
